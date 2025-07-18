@@ -28,188 +28,239 @@ export interface Founder {
   avatar?: string
 }
 
+// Rate limiting helper
+class RateLimiter {
+  private queue: Array<() => Promise<any>> = []
+  private processing = false
+  private lastRequest = 0
+  private minInterval = 1000 // 1 second between requests
+
+  async add<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise((resolve, reject) => {
+      this.queue.push(async () => {
+        try {
+          const result = await fn()
+          resolve(result)
+        } catch (error) {
+          reject(error)
+        }
+      })
+      this.process()
+    })
+  }
+
+  private async process() {
+    if (this.processing || this.queue.length === 0) return
+    
+    this.processing = true
+    
+    while (this.queue.length > 0) {
+      const now = Date.now()
+      const timeSinceLastRequest = now - this.lastRequest
+      
+      if (timeSinceLastRequest < this.minInterval) {
+        await new Promise(resolve => setTimeout(resolve, this.minInterval - timeSinceLastRequest))
+      }
+      
+      const fn = this.queue.shift()
+      if (fn) {
+        try {
+          await fn()
+        } catch (error) {
+          console.error('Rate limited request failed:', error)
+        }
+        this.lastRequest = Date.now()
+      }
+    }
+    
+    this.processing = false
+  }
+}
+
+const rateLimiter = new RateLimiter()
+
 export function useSignalData() {
   const [signals, setSignals] = useState<Signal[]>([])
   const [founders, setFounders] = useState<Founder[]>([])
   const [isLive, setIsLive] = useState(true)
   const [loading, setLoading] = useState(true)
   const [lastFetch, setLastFetch] = useState<Date | null>(null)
+  const [error, setError] = useState<string | null>(null)
 
-  // Fetch fresh signals from Twitter and GitHub
-  const fetchFreshSignals = useCallback(async (userId: string) => {
-    try {
-      console.log('Calling Twitter API...')
-      // Fetch Twitter signals
-      const twitterResponse = await fetch('https://p5kq90z5--fetch-twitter-signals.functions.blink.new')
-      let twitterSignals = []
-      if (twitterResponse.ok) {
-        const twitterData = await twitterResponse.json()
-        if (twitterData.success) {
-          twitterSignals = twitterData.signals
-          console.log('Twitter signals:', twitterSignals.length)
-        } else if (twitterData.rateLimited) {
-          console.log('Twitter API rate limited, using mock data')
-        }
-      } else {
-        console.error('Twitter API failed:', twitterResponse.status, await twitterResponse.text())
-      }
-
-      console.log('Calling GitHub API...')
-      // Fetch GitHub signals
-      const githubResponse = await fetch('https://p5kq90z5--fetch-github-signals.functions.blink.new')
-      let githubSignals = []
-      if (githubResponse.ok) {
-        const githubData = await githubResponse.json()
-        if (githubData.success) {
-          githubSignals = githubData.signals
-          console.log('GitHub signals:', githubSignals.length)
-        }
-      } else {
-        console.error('GitHub API failed:', githubResponse.status, await githubResponse.text())
-      }
-
-      // Combine and process signals
-      let allFreshSignals = [...twitterSignals, ...githubSignals]
-      
-      // If no signals from APIs, use mock data for demo
-      if (allFreshSignals.length === 0) {
-        console.log('No signals from APIs, using mock data for demo')
-        allFreshSignals = getMockSignals()
-      }
-      
-      console.log('Total fresh signals:', allFreshSignals.length)
-
-      if (allFreshSignals.length > 0) {
-        // Store signals and founders in database
-        await storeSignalsInDatabase(allFreshSignals, userId)
-        
-        // Update UI with fresh data
-        await refreshDataFromDatabase(userId)
-        
-        setLastFetch(new Date())
-      }
-
-    } catch (error) {
-      console.error('Error fetching fresh signals:', error)
-      
-      // Fallback to mock data on error
+  // Enhanced error handling with exponential backoff
+  const withRetry = useCallback(async <T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> => {
+    let lastError: any
+    
+    for (let i = 0; i < maxRetries; i++) {
       try {
-        const mockSignals = getMockSignals()
-        await storeSignalsInDatabase(mockSignals, userId)
-        await refreshDataFromDatabase(userId)
-        setLastFetch(new Date())
-      } catch (mockError) {
-        console.error('Error with mock data fallback:', mockError)
+        return await fn()
+      } catch (error: any) {
+        lastError = error
+        
+        // Handle rate limiting specifically
+        if (error.status === 429) {
+          const retryAfter = error.details?.reset ? 
+            new Date(error.details.reset).getTime() - Date.now() : 
+            Math.pow(2, i) * 1000
+          
+          console.log(`Rate limited, waiting ${retryAfter}ms before retry ${i + 1}/${maxRetries}`)
+          await new Promise(resolve => setTimeout(resolve, retryAfter))
+          continue
+        }
+        
+        // For other errors, use exponential backoff
+        if (i < maxRetries - 1) {
+          const delay = Math.pow(2, i) * 1000
+          console.log(`Request failed, retrying in ${delay}ms (${i + 1}/${maxRetries})`)
+          await new Promise(resolve => setTimeout(resolve, delay))
+        }
       }
     }
+    
+    throw lastError
   }, [])
 
-  // Store signals in database
-  const storeSignalsInDatabase = async (freshSignals: any[], userId: string) => {
-    try {
-      for (const signalData of freshSignals) {
-        // Create or update founder
-        const founderId = `${signalData.signal.source}_${signalData.founder.username}`
-        
-        try {
-          await blink.db.founders.create({
-            id: founderId,
-            name: signalData.founder.name,
-            company: signalData.founder.company || 'Unknown Company',
-            description: signalData.founder.description,
-            location: signalData.founder.location,
-            score: signalData.signal.strength,
-            signals_count: 1,
-            twitter_handle: signalData.signal.source === 'twitter' ? signalData.founder.username : null,
-            github_username: signalData.signal.source === 'github' ? signalData.founder.username : null,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-            user_id: userId
-          })
-        } catch (error) {
-          // Founder might already exist, try to update
-          try {
-            const existingFounder = await blink.db.founders.list({ 
-              where: { id: founderId, user_id: userId }, 
-              limit: 1 
-            })
-            if (existingFounder.length > 0) {
-              await blink.db.founders.update(founderId, {
-                score: Math.max(existingFounder[0].score, signalData.signal.strength),
-                signals_count: (existingFounder[0].signals_count || 0) + 1,
-                updated_at: new Date().toISOString()
-              })
-            }
-          } catch (updateError) {
-            console.error('Error updating founder:', updateError)
-          }
-        }
+  // Batch database operations to reduce API calls
+  const batchedDbOperation = useCallback(async <T>(operation: () => Promise<T>): Promise<T> => {
+    return rateLimiter.add(operation)
+  }, [])
 
-        // Create signal
-        try {
-          await blink.db.signals.create({
-            id: signalData.id,
-            founder_id: founderId,
-            source: signalData.signal.source,
-            signal_type: signalData.signal.signalType,
-            title: signalData.signal.title,
-            description: signalData.signal.description,
-            url: signalData.signal.url,
-            strength: signalData.signal.strength,
-            engagement_count: signalData.signal.engagement,
-            followers_count: signalData.founder.followers,
-            detected_at: signalData.signal.createdAt,
-            created_at: new Date().toISOString(),
-            user_id: userId
-          })
-        } catch (error) {
-          // Signal might already exist, skip
-          console.log('Signal already exists:', signalData.id)
-        }
+  // Store signals with proper upsert and rate limiting
+  const storeSignalsInDatabase = useCallback(async (freshSignals: any[], userId: string) => {
+    try {
+      // Process in smaller batches to avoid overwhelming the API
+      const batchSize = 5
+      const batches = []
+      
+      for (let i = 0; i < freshSignals.length; i += batchSize) {
+        batches.push(freshSignals.slice(i, i + batchSize))
+      }
+
+      for (const batch of batches) {
+        await Promise.all(batch.map(async (signalData) => {
+          try {
+            const founderId = `${signalData.signal.source}_${signalData.founder.username}`
+            
+            // Use upsert pattern for founders
+            await batchedDbOperation(async () => {
+              try {
+                // Try to create founder
+                await blink.db.founders.create({
+                  id: founderId,
+                  name: signalData.founder.name,
+                  company: signalData.founder.company || 'Unknown Company',
+                  description: signalData.founder.description || '',
+                  location: signalData.founder.location || 'Unknown',
+                  score: signalData.signal.strength,
+                  signals_count: 1,
+                  twitter_handle: signalData.signal.source === 'twitter' ? signalData.founder.username : null,
+                  github_username: signalData.signal.source === 'github' ? signalData.founder.username : null,
+                  created_at: new Date().toISOString(),
+                  updated_at: new Date().toISOString(),
+                  user_id: userId
+                })
+              } catch (error: any) {
+                // If founder exists, update it
+                if (error.status === 409) {
+                  const existingFounders = await blink.db.founders.list({ 
+                    where: { id: founderId, user_id: userId }, 
+                    limit: 1 
+                  })
+                  if (existingFounders.length > 0) {
+                    await blink.db.founders.update(founderId, {
+                      score: Math.max(existingFounders[0].score, signalData.signal.strength),
+                      signals_count: (existingFounders[0].signals_count || 0) + 1,
+                      updated_at: new Date().toISOString()
+                    })
+                  }
+                } else {
+                  throw error
+                }
+              }
+            })
+
+            // Use upsert pattern for signals
+            await batchedDbOperation(async () => {
+              try {
+                await blink.db.signals.create({
+                  id: signalData.id,
+                  founder_id: founderId,
+                  source: signalData.signal.source,
+                  signal_type: signalData.signal.signalType,
+                  title: signalData.signal.title,
+                  description: signalData.signal.description,
+                  url: signalData.signal.url,
+                  strength: signalData.signal.strength,
+                  engagement_count: signalData.signal.engagement,
+                  followers_count: signalData.founder.followers,
+                  detected_at: signalData.signal.createdAt,
+                  created_at: new Date().toISOString(),
+                  user_id: userId
+                })
+              } catch (error: any) {
+                // Signal already exists, skip
+                if (error.status === 409) {
+                  console.log('Signal already exists:', signalData.id)
+                } else {
+                  throw error
+                }
+              }
+            })
+            
+          } catch (error) {
+            console.error('Error processing signal:', signalData.id, error)
+          }
+        }))
+        
+        // Small delay between batches
+        await new Promise(resolve => setTimeout(resolve, 500))
       }
     } catch (error) {
       console.error('Error storing signals in database:', error)
+      throw error
     }
-  }
+  }, [batchedDbOperation])
 
-  // Refresh data from database
-  const refreshDataFromDatabase = async (userId: string) => {
+  // Refresh data from database with rate limiting
+  const refreshDataFromDatabase = useCallback(async (userId: string) => {
     try {
-      const freshSignals = await blink.db.signals.list({
-        where: { user_id: userId },
-        orderBy: { created_at: 'desc' },
-        limit: 50
-      })
+      const [freshSignals, freshFounders] = await Promise.all([
+        batchedDbOperation(() => 
+          withRetry(() => blink.db.signals.list({
+            where: { user_id: userId },
+            orderBy: { created_at: 'desc' },
+            limit: 50
+          }))
+        ),
+        batchedDbOperation(() => 
+          withRetry(() => blink.db.founders.list({
+            where: { user_id: userId },
+            orderBy: { score: 'desc' },
+            limit: 20
+          }))
+        )
+      ])
 
-      const freshFounders = await blink.db.founders.list({
-        where: { user_id: userId },
-        orderBy: { score: 'desc' },
-        limit: 20
+      // Transform data efficiently
+      const transformedSignals = freshSignals.map((signal: any) => {
+        const founder = freshFounders.find((f: any) => f.id === signal.founder_id)
+        
+        return {
+          id: signal.id,
+          founder: founder?.name || 'Unknown',
+          company: founder?.company || 'Unknown Company',
+          signal: signal.title,
+          source: signal.source,
+          strength: signal.strength,
+          location: founder?.location || 'Unknown',
+          time: getTimeAgo(signal.created_at),
+          description: signal.description || founder?.description || '',
+          category: signal.signal_type,
+          engagement: signal.engagement_count || 0,
+          followers: formatFollowers(signal.followers_count || 0),
+          isNew: isRecentSignal(signal.created_at)
+        }
       })
-
-      // Transform fresh data
-      const transformedSignals = await Promise.all(
-        freshSignals.map(async (signal: any) => {
-          const founder = freshFounders.find((f: any) => f.id === signal.founder_id) || 
-                         await blink.db.founders.list({ where: { id: signal.founder_id }, limit: 1 }).then(f => f[0])
-          
-          return {
-            id: signal.id,
-            founder: founder?.name || 'Unknown',
-            company: founder?.company || 'Unknown Company',
-            signal: signal.title,
-            source: signal.source,
-            strength: signal.strength,
-            location: founder?.location || 'Unknown',
-            time: getTimeAgo(signal.created_at),
-            description: signal.description || founder?.description || '',
-            category: signal.signal_type,
-            engagement: signal.engagement_count || 0,
-            followers: formatFollowers(signal.followers_count || 0),
-            isNew: isRecentSignal(signal.created_at)
-          }
-        })
-      )
 
       const transformedFounders = freshFounders.map((founder: any) => ({
         id: founder.id,
@@ -227,13 +278,93 @@ export function useSignalData() {
 
     } catch (error) {
       console.error('Error refreshing data from database:', error)
+      throw error
     }
-  }
+  }, [batchedDbOperation, withRetry])
 
-  // Load initial data and fetch fresh signals
+  // Fetch fresh signals from APIs with better error handling
+  const fetchFreshSignals = useCallback(async (userId: string) => {
+    try {
+      setError(null)
+      console.log('Fetching fresh signals...')
+      
+      // Fetch from both APIs concurrently but with error isolation
+      const [twitterResult, githubResult] = await Promise.allSettled([
+        fetch('https://p5kq90z5--fetch-twitter-signals.functions.blink.new')
+          .then(async (response) => {
+            if (!response.ok) {
+              throw new Error(`Twitter API failed: ${response.status}`)
+            }
+            const data = await response.json()
+            return data.success ? data.signals : []
+          }),
+        fetch('https://p5kq90z5--fetch-github-signals.functions.blink.new')
+          .then(async (response) => {
+            if (!response.ok) {
+              throw new Error(`GitHub API failed: ${response.status}`)
+            }
+            const data = await response.json()
+            return data.success ? data.signals : []
+          })
+      ])
+
+      let allFreshSignals: any[] = []
+      
+      if (twitterResult.status === 'fulfilled') {
+        allFreshSignals.push(...twitterResult.value)
+        console.log('Twitter signals:', twitterResult.value.length)
+      } else {
+        console.error('Twitter API failed:', twitterResult.reason)
+      }
+      
+      if (githubResult.status === 'fulfilled') {
+        allFreshSignals.push(...githubResult.value)
+        console.log('GitHub signals:', githubResult.value.length)
+      } else {
+        console.error('GitHub API failed:', githubResult.reason)
+      }
+
+      // If no signals from APIs, use mock data for demo
+      if (allFreshSignals.length === 0) {
+        console.log('No signals from APIs, using mock data for demo')
+        allFreshSignals = getMockSignals()
+      }
+      
+      console.log('Total fresh signals:', allFreshSignals.length)
+
+      if (allFreshSignals.length > 0) {
+        // Store signals with rate limiting
+        await storeSignalsInDatabase(allFreshSignals, userId)
+        
+        // Refresh UI data
+        await refreshDataFromDatabase(userId)
+        
+        setLastFetch(new Date())
+      }
+
+    } catch (error) {
+      console.error('Error fetching fresh signals:', error)
+      setError('Failed to fetch fresh signals. Using existing data.')
+      
+      // Fallback to mock data on error
+      try {
+        const mockSignals = getMockSignals()
+        await storeSignalsInDatabase(mockSignals, userId)
+        await refreshDataFromDatabase(userId)
+        setLastFetch(new Date())
+      } catch (mockError) {
+        console.error('Error with mock data fallback:', mockError)
+        setError('Unable to load any data. Please try refreshing.')
+      }
+    }
+  }, [storeSignalsInDatabase, refreshDataFromDatabase])
+
+  // Load initial data with improved error handling
   useEffect(() => {
     const loadData = async () => {
       try {
+        setError(null)
+        
         // Get current user
         const user = await blink.auth.me()
         if (!user) {
@@ -244,67 +375,27 @@ export function useSignalData() {
 
         console.log('Loading signals for user:', user.id)
 
-        // First, try to load existing signals from database
-        const existingSignals = await blink.db.signals.list({
-          where: { user_id: user.id },
-          orderBy: { created_at: 'desc' },
-          limit: 50
-        })
-
-        const existingFounders = await blink.db.founders.list({
-          where: { user_id: user.id },
-          orderBy: { score: 'desc' },
-          limit: 20
-        })
-
-        console.log('Loaded from DB:', existingSignals.length, 'signals,', existingFounders.length, 'founders')
-
-        // Transform existing data
-        if (existingSignals.length > 0) {
-          const transformedSignals = await Promise.all(
-            existingSignals.map(async (signal: any) => {
-              const founder = existingFounders.find((f: any) => f.id === signal.founder_id) || 
-                             await blink.db.founders.list({ where: { id: signal.founder_id }, limit: 1 }).then(f => f[0])
-              
-              return {
-                id: signal.id,
-                founder: founder?.name || 'Unknown',
-                company: founder?.company || 'Unknown Company',
-                signal: signal.title,
-                source: signal.source,
-                strength: signal.strength,
-                location: founder?.location || 'Unknown',
-                time: getTimeAgo(signal.created_at),
-                description: signal.description || founder?.description || '',
-                category: signal.signal_type,
-                engagement: signal.engagement_count || 0,
-                followers: formatFollowers(signal.followers_count || 0)
-              }
-            })
-          )
-
-          const transformedFounders = existingFounders.map((founder: any) => ({
-            id: founder.id,
-            name: founder.name,
-            company: founder.company,
-            score: founder.score,
-            signals: founder.signals_count,
-            location: founder.location,
-            description: founder.description,
-            avatar: founder.avatar_url
-          }))
-
-          setSignals(transformedSignals)
-          setFounders(transformedFounders)
+        // First, load existing data from database (fast)
+        try {
+          await refreshDataFromDatabase(user.id)
+          console.log('Loaded existing data from database')
+        } catch (error) {
+          console.error('Error loading existing data:', error)
+          // Continue to fetch fresh data even if existing data fails
         }
 
-        // Fetch fresh signals from APIs (this will take a moment)
-        console.log('Fetching fresh signals from APIs...')
-        await fetchFreshSignals(user.id)
+        // Then fetch fresh data in background (slower)
+        setTimeout(async () => {
+          try {
+            await fetchFreshSignals(user.id)
+          } catch (error) {
+            console.error('Background refresh failed:', error)
+          }
+        }, 1000) // 1 second delay to let UI render first
 
       } catch (error) {
         console.error('Error loading data:', error)
-        // Show empty state on error
+        setError('Failed to load data. Please try refreshing.')
         setSignals([])
         setFounders([])
       } finally {
@@ -313,9 +404,9 @@ export function useSignalData() {
     }
 
     loadData()
-  }, [fetchFreshSignals])
+  }, [fetchFreshSignals, refreshDataFromDatabase])
 
-  // Auto-refresh every 5 minutes when live
+  // Auto-refresh with longer intervals to avoid rate limits
   useEffect(() => {
     if (!isLive) return
 
@@ -328,7 +419,7 @@ export function useSignalData() {
       } catch (error) {
         console.error('Error in auto-refresh:', error)
       }
-    }, 5 * 60 * 1000) // 5 minutes
+    }, 10 * 60 * 1000) // 10 minutes instead of 5
 
     return () => clearInterval(interval)
   }, [isLive, fetchFreshSignals])
@@ -377,13 +468,20 @@ export function useSignalData() {
     isLive,
     loading,
     lastFetch,
+    error,
     toggleLiveMode,
     getStats,
     getSourceStats,
     refreshData: async () => {
-      const user = await blink.auth.me()
-      if (user) {
-        await fetchFreshSignals(user.id)
+      try {
+        setError(null)
+        const user = await blink.auth.me()
+        if (user) {
+          await fetchFreshSignals(user.id)
+        }
+      } catch (error) {
+        console.error('Manual refresh failed:', error)
+        setError('Refresh failed. Please try again.')
       }
     }
   }

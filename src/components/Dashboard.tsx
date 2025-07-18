@@ -152,7 +152,7 @@ const getStrengthColor = (strength: number) => {
 }
 
 export default function Dashboard() {
-  const { signals, founders, isLive, loading, toggleLiveMode, getStats, getSourceStats, refreshData } = useSignalData()
+  const { signals, founders, isLive, loading, error, toggleLiveMode, getStats, getSourceStats, refreshData } = useSignalData()
   const [selectedSignal, setSelectedSignal] = useState<Signal | null>(null)
   const [isModalOpen, setIsModalOpen] = useState(false)
 
@@ -239,6 +239,11 @@ export default function Dashboard() {
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Dashboard</h1>
           <p className="text-gray-600">Real-time VC sourcing intelligence</p>
+          {error && (
+            <div className="mt-2 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
+              <p className="text-sm text-yellow-800">{error}</p>
+            </div>
+          )}
         </div>
         <div className="flex items-center space-x-3">
           <div className="flex items-center space-x-2 px-3 py-1 bg-green-50 rounded-full">
