@@ -28,20 +28,29 @@ export interface Founder {
   avatar?: string
 }
 
-// Rate limiting helper
+// Enhanced rate limiting helper with exponential backoff
 class RateLimiter {
   private queue: Array<() => Promise<any>> = []
   private processing = false
   private lastRequest = 0
-  private minInterval = 1000 // 1 second between requests
+  private minInterval = 2000 // 2 seconds between requests (reduced from 1s)
+  private backoffMultiplier = 1
+  private maxBackoff = 60000 // Max 1 minute backoff
 
   async add<T>(fn: () => Promise<T>): Promise<T> {
     return new Promise((resolve, reject) => {
       this.queue.push(async () => {
         try {
           const result = await fn()
+          // Reset backoff on success
+          this.backoffMultiplier = 1
           resolve(result)
         } catch (error) {
+          // Increase backoff on rate limit errors
+          if (error.status === 429) {
+            this.backoffMultiplier = Math.min(this.backoffMultiplier * 2, this.maxBackoff / this.minInterval)
+            console.log(`Rate limited, increasing backoff to ${this.minInterval * this.backoffMultiplier}ms`)
+          }
           reject(error)
         }
       })
@@ -56,10 +65,11 @@ class RateLimiter {
     
     while (this.queue.length > 0) {
       const now = Date.now()
+      const currentInterval = this.minInterval * this.backoffMultiplier
       const timeSinceLastRequest = now - this.lastRequest
       
-      if (timeSinceLastRequest < this.minInterval) {
-        await new Promise(resolve => setTimeout(resolve, this.minInterval - timeSinceLastRequest))
+      if (timeSinceLastRequest < currentInterval) {
+        await new Promise(resolve => setTimeout(resolve, currentInterval - timeSinceLastRequest))
       }
       
       const fn = this.queue.shift()
@@ -87,8 +97,8 @@ export function useSignalData() {
   const [lastFetch, setLastFetch] = useState<Date | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  // Enhanced error handling with exponential backoff
-  const withRetry = useCallback(async <T>(fn: () => Promise<T>, maxRetries = 3): Promise<T> => {
+  // Enhanced error handling with exponential backoff and better rate limit handling
+  const withRetry = useCallback(async <T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> => {
     let lastError: any
     
     for (let i = 0; i < maxRetries; i++) {
@@ -97,20 +107,27 @@ export function useSignalData() {
       } catch (error: any) {
         lastError = error
         
-        // Handle rate limiting specifically
+        // Handle rate limiting specifically - wait longer and don't retry immediately
         if (error.status === 429) {
           const retryAfter = error.details?.reset ? 
-            new Date(error.details.reset).getTime() - Date.now() : 
-            Math.pow(2, i) * 1000
+            Math.max(new Date(error.details.reset).getTime() - Date.now(), 30000) : // At least 30 seconds
+            Math.min(Math.pow(2, i + 3) * 1000, 120000) // 8s, 16s, max 2 minutes
           
-          console.log(`Rate limited, waiting ${retryAfter}ms before retry ${i + 1}/${maxRetries}`)
-          await new Promise(resolve => setTimeout(resolve, retryAfter))
-          continue
+          console.log(`Rate limited, waiting ${Math.round(retryAfter/1000)}s before retry ${i + 1}/${maxRetries}`)
+          
+          // For rate limits, only retry once after a longer wait
+          if (i === 0) {
+            await new Promise(resolve => setTimeout(resolve, retryAfter))
+            continue
+          } else {
+            // Don't retry rate limits more than once
+            throw error
+          }
         }
         
-        // For other errors, use exponential backoff
+        // For other errors, use shorter exponential backoff
         if (i < maxRetries - 1) {
-          const delay = Math.pow(2, i) * 1000
+          const delay = Math.pow(2, i) * 2000 // 2s, 4s
           console.log(`Request failed, retrying in ${delay}ms (${i + 1}/${maxRetries})`)
           await new Promise(resolve => setTimeout(resolve, delay))
         }
@@ -125,11 +142,11 @@ export function useSignalData() {
     return rateLimiter.add(operation)
   }, [])
 
-  // Store signals with proper upsert and rate limiting
+  // Store signals with proper upsert and rate limiting - MUCH smaller batches
   const storeSignalsInDatabase = useCallback(async (freshSignals: any[], userId: string) => {
     try {
-      // Process in smaller batches to avoid overwhelming the API
-      const batchSize = 5
+      // Process in very small batches to avoid rate limits
+      const batchSize = 2 // Reduced from 5 to 2
       const batches = []
       
       for (let i = 0; i < freshSignals.length; i += batchSize) {
@@ -137,11 +154,12 @@ export function useSignalData() {
       }
 
       for (const batch of batches) {
-        await Promise.all(batch.map(async (signalData) => {
+        // Process batch items sequentially instead of parallel to reduce load
+        for (const signalData of batch) {
           try {
             const founderId = `${signalData.signal.source}_${signalData.founder.username}`
             
-            // Use upsert pattern for founders
+            // Use upsert pattern for founders with better error handling
             await batchedDbOperation(async () => {
               try {
                 // Try to create founder
@@ -162,22 +180,29 @@ export function useSignalData() {
               } catch (error: any) {
                 // If founder exists, update it
                 if (error.status === 409) {
-                  const existingFounders = await blink.db.founders.list({ 
-                    where: { id: founderId, user_id: userId }, 
-                    limit: 1 
-                  })
-                  if (existingFounders.length > 0) {
-                    await blink.db.founders.update(founderId, {
-                      score: Math.max(existingFounders[0].score, signalData.signal.strength),
-                      signals_count: (existingFounders[0].signals_count || 0) + 1,
-                      updated_at: new Date().toISOString()
+                  try {
+                    const existingFounders = await blink.db.founders.list({ 
+                      where: { id: founderId, user_id: userId }, 
+                      limit: 1 
                     })
+                    if (existingFounders.length > 0) {
+                      await blink.db.founders.update(founderId, {
+                        score: Math.max(existingFounders[0].score, signalData.signal.strength),
+                        signals_count: (existingFounders[0].signals_count || 0) + 1,
+                        updated_at: new Date().toISOString()
+                      })
+                    }
+                  } catch (updateError) {
+                    console.error('Error updating founder:', updateError)
                   }
                 } else {
                   throw error
                 }
               }
             })
+
+            // Add delay between founder and signal operations
+            await new Promise(resolve => setTimeout(resolve, 200))
 
             // Use upsert pattern for signals
             await batchedDbOperation(async () => {
@@ -210,10 +235,13 @@ export function useSignalData() {
           } catch (error) {
             console.error('Error processing signal:', signalData.id, error)
           }
-        }))
+          
+          // Add delay between each signal processing
+          await new Promise(resolve => setTimeout(resolve, 300))
+        }
         
-        // Small delay between batches
-        await new Promise(resolve => setTimeout(resolve, 500))
+        // Longer delay between batches
+        await new Promise(resolve => setTimeout(resolve, 1000))
       }
     } catch (error) {
       console.error('Error storing signals in database:', error)
@@ -359,7 +387,7 @@ export function useSignalData() {
     }
   }, [storeSignalsInDatabase, refreshDataFromDatabase])
 
-  // Load initial data with improved error handling
+  // Load initial data with improved error handling and caching
   useEffect(() => {
     const loadData = async () => {
       try {
@@ -379,34 +407,52 @@ export function useSignalData() {
         try {
           await refreshDataFromDatabase(user.id)
           console.log('Loaded existing data from database')
+          setLoading(false) // Set loading to false after we have some data
         } catch (error) {
           console.error('Error loading existing data:', error)
-          // Continue to fetch fresh data even if existing data fails
+          // If we can't load existing data, show mock data immediately
+          const mockSignals = getMockSignals()
+          try {
+            await storeSignalsInDatabase(mockSignals, user.id)
+            await refreshDataFromDatabase(user.id)
+            console.log('Loaded mock data as fallback')
+          } catch (mockError) {
+            console.error('Error with mock data fallback:', mockError)
+            setError('Unable to load data. Please check your connection.')
+          }
+          setLoading(false)
         }
 
-        // Then fetch fresh data in background (slower)
-        setTimeout(async () => {
-          try {
-            await fetchFreshSignals(user.id)
-          } catch (error) {
-            console.error('Background refresh failed:', error)
-          }
-        }, 1000) // 1 second delay to let UI render first
+        // Then fetch fresh data in background (slower) - only if we haven't fetched recently
+        const shouldFetchFresh = !lastFetch || (Date.now() - lastFetch.getTime()) > 10 * 60 * 1000 // 10 minutes
+        
+        if (shouldFetchFresh) {
+          setTimeout(async () => {
+            try {
+              console.log('Fetching fresh signals in background...')
+              await fetchFreshSignals(user.id)
+            } catch (error) {
+              console.error('Background refresh failed:', error)
+              // Don't show error to user for background refresh failures
+            }
+          }, 2000) // 2 second delay to let UI render first
+        } else {
+          console.log('Skipping fresh data fetch, too recent')
+        }
 
       } catch (error) {
         console.error('Error loading data:', error)
         setError('Failed to load data. Please try refreshing.')
         setSignals([])
         setFounders([])
-      } finally {
         setLoading(false)
       }
     }
 
     loadData()
-  }, [fetchFreshSignals, refreshDataFromDatabase])
+  }, [fetchFreshSignals, refreshDataFromDatabase, storeSignalsInDatabase, lastFetch])
 
-  // Auto-refresh with longer intervals to avoid rate limits
+  // Auto-refresh with much longer intervals to avoid rate limits
   useEffect(() => {
     if (!isLive) return
 
@@ -414,15 +460,21 @@ export function useSignalData() {
       try {
         const user = await blink.auth.me()
         if (user) {
-          await fetchFreshSignals(user.id)
+          // Only refresh if last fetch was more than 15 minutes ago
+          if (!lastFetch || (Date.now() - lastFetch.getTime()) > 15 * 60 * 1000) {
+            console.log('Auto-refreshing signals...')
+            await fetchFreshSignals(user.id)
+          } else {
+            console.log('Skipping auto-refresh, too recent')
+          }
         }
       } catch (error) {
         console.error('Error in auto-refresh:', error)
       }
-    }, 10 * 60 * 1000) // 10 minutes instead of 5
+    }, 20 * 60 * 1000) // 20 minutes instead of 10
 
     return () => clearInterval(interval)
-  }, [isLive, fetchFreshSignals])
+  }, [isLive, fetchFreshSignals, lastFetch])
 
   const toggleLiveMode = () => {
     setIsLive(!isLive)

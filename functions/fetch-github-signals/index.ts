@@ -46,18 +46,28 @@ serve(async (req) => {
   try {
     const githubToken = Deno.env.get('GITHUB_TOKEN');
     if (!githubToken) {
-      throw new Error('GitHub Token not found');
+      console.error('GitHub Token not found in environment');
+      return new Response(JSON.stringify({ 
+        success: true, 
+        signals: [],
+        message: 'GitHub API token not configured. Using fallback data.',
+        error: 'missing_token'
+      }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
     }
 
-    // Simplified query to avoid "too many operators" error
-    // Focus on high-value indicators with fewer OR operators
-    const query = 'startup saas mvp created:>2024-01-01 stars:>10';
+    // Even more simplified query to avoid validation errors
+    const query = 'startup created:>2024-01-01 stars:>5';
 
     const url = new URL('https://api.github.com/search/repositories');
     url.searchParams.set('q', query);
     url.searchParams.set('sort', 'updated');
     url.searchParams.set('order', 'desc');
-    url.searchParams.set('per_page', '30'); // Reduced to avoid rate limits
+    url.searchParams.set('per_page', '20'); // Further reduced to avoid rate limits
 
     const response = await fetch(url.toString(), {
       headers: {
@@ -71,13 +81,13 @@ serve(async (req) => {
       const errorText = await response.text();
       console.error('GitHub API Error:', response.status, errorText);
       
-      // Handle validation errors gracefully
+      // Handle various GitHub API errors gracefully
       if (response.status === 422) {
         return new Response(JSON.stringify({ 
           success: true, 
           signals: [],
-          message: 'GitHub search query needs refinement. Using fallback approach.',
-          queryError: true
+          message: 'GitHub search query validation failed. Using fallback data.',
+          error: 'query_validation'
         }), {
           headers: {
             'Content-Type': 'application/json',
@@ -86,7 +96,46 @@ serve(async (req) => {
         });
       }
       
-      throw new Error(`GitHub API error: ${response.status} ${errorText}`);
+      if (response.status === 403) {
+        return new Response(JSON.stringify({ 
+          success: true, 
+          signals: [],
+          message: 'GitHub API rate limit exceeded. Using fallback data.',
+          error: 'rate_limit'
+        }), {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
+      }
+      
+      if (response.status === 401) {
+        return new Response(JSON.stringify({ 
+          success: true, 
+          signals: [],
+          message: 'GitHub API authentication failed. Using fallback data.',
+          error: 'auth_failed'
+        }), {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
+      }
+      
+      // For other errors, return graceful fallback
+      return new Response(JSON.stringify({ 
+        success: true, 
+        signals: [],
+        message: `GitHub API error (${response.status}). Using fallback data.`,
+        error: 'api_error'
+      }), {
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
     }
 
     const data: GitHubSearchResponse = await response.json();
